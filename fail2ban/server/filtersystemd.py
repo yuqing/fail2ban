@@ -87,7 +87,7 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 			args['files'] = list(set(files))
 
 		try:
-			args['flags'] = kwargs.pop('journalflags')
+			args['flags'] = int(kwargs.pop('journalflags'))
 		except KeyError:
 			pass
 
@@ -208,7 +208,14 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 			if not v:
 				v = logentry.get('_PID')
 			if v:
-				logelements[-1] += ("[%i]" % v)
+				try: # [integer] (if already numeric):
+					v = "[%i]" % v
+				except TypeError:
+					try: # as [integer] (try to convert to int):
+						v = "[%i]" % int(v, 0)
+					except (TypeError, ValueError): # fallback - [string] as it is
+						v = "[%s]" % v
+				logelements[-1] += v
 			logelements[-1] += ":"
 			if logelements[-1] == "kernel:":
 				if '_SOURCE_MONOTONIC_TIMESTAMP' in logentry:
@@ -229,7 +236,7 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 		logSys.log(5, "[%s] Read systemd journal entry: %s %s", self.jailName,
 			date.isoformat(), logline)
 		## use the same type for 1st argument:
-		return ((logline[:0], date.isoformat(), logline),
+		return ((logline[:0], date.isoformat(), logline.replace('\n', '\\n')),
 			time.mktime(date.timetuple()) + date.microsecond/1.0E6)
 
 	def seekToTime(self, date):
@@ -300,12 +307,8 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 					else:
 						break
 				if self.__modified:
-					try:
-						while True:
-							ticket = self.failManager.toBan()
-							self.jail.putFailTicket(ticket)
-					except FailManagerEmpty:
-						self.failManager.cleanup(MyTime.time())
+					self.performBan()
+					self.__modified = 0
 			except Exception as e: # pragma: no cover
 				if not self.active: # if not active - error by stop...
 					break
@@ -315,6 +318,7 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 				self.commonError()
 
 		logSys.debug("[%s] filter terminated", self.jailName)
+
 		# close journal:
 		try:
 			if self.__journal:
@@ -322,8 +326,8 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 		except Exception as e: # pragma: no cover
 			logSys.error("Close journal failed: %r", e,
 				exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
-		logSys.debug((self.jail is not None and self.jail.name
-                      or "jailless") +" filter terminated")
+
+		logSys.debug("[%s] filter exited (systemd)", self.jailName)
 		return True
 
 	def status(self, flavor="basic"):

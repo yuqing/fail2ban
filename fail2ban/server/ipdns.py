@@ -42,6 +42,32 @@ def asip(ip):
 		return ip
 	return IPAddr(ip)
 
+def getfqdn(name=''):
+	"""Get fully-qualified hostname of given host, thereby resolve of an external
+	IPs and name will be preferred before the local domain (or a loopback), see gh-2438
+	"""
+	try:
+		name = name or socket.gethostname()
+		names = (
+			ai[3] for ai in socket.getaddrinfo(
+				name, None, 0, socket.SOCK_DGRAM, 0, socket.AI_CANONNAME
+			) if ai[3]
+		)
+		if names:
+			# first try to find a fqdn starting with the host name like www.domain.tld for www:
+			pref = name+'.'
+			first = None
+			for ai in names:
+				if ai.startswith(pref):
+					return ai
+				if not first: first = ai
+			# not found - simply use first known fqdn:
+			return first
+	except socket.error:
+		pass
+	# fallback to python's own getfqdn routine:
+	return socket.getfqdn(name)
+
 
 ##
 # Utils class for DNS handling.
@@ -64,15 +90,19 @@ class DNSUtils:
 		if ips is not None: 
 			return ips
 		# retrieve ips
-		ips = list()
+		ips = set()
 		saveerr = None
 		for fam, ipfam in ((socket.AF_INET, IPAddr.FAM_IPv4), (socket.AF_INET6, IPAddr.FAM_IPv6)):
 			try:
 				for result in socket.getaddrinfo(dns, None, fam, 0, socket.IPPROTO_TCP):
-					ip = IPAddr(result[4][0], ipfam)
+					# if getaddrinfo returns something unexpected:
+					if len(result) < 4 or not len(result[4]): continue
+					# get ip from `(2, 1, 6, '', ('127.0.0.1', 0))`,be sure we've an ip-string
+					# (some python-versions resp. host configurations causes returning of integer there):
+					ip = IPAddr(str(result[4][0]), ipfam)
 					if ip.isValid:
-						ips.append(ip)
-			except socket.error as e:
+						ips.add(ip)
+			except Exception as e:
 				saveerr = e
 		if not ips and saveerr:
 			logSys.warning("Unable to find a corresponding IP address for %s: %s", dns, saveerr)
@@ -99,24 +129,45 @@ class DNSUtils:
 	def textToIp(text, useDns):
 		""" Return the IP of DNS found in a given text.
 		"""
-		ipList = list()
+		ipList = set()
 		# Search for plain IP
 		plainIP = IPAddr.searchIP(text)
 		if plainIP is not None:
 			ip = IPAddr(plainIP)
 			if ip.isValid:
-				ipList.append(ip)
+				ipList.add(ip)
 
 		# If we are allowed to resolve -- give it a try if nothing was found
 		if useDns in ("yes", "warn") and not ipList:
 			# Try to get IP from possible DNS
 			ip = DNSUtils.dnsToIp(text)
-			ipList.extend(ip)
+			ipList.update(ip)
 			if ip and useDns == "warn":
 				logSys.warning("Determined IP using DNS Lookup: %s = %s",
 					text, ipList)
 
 		return ipList
+
+	@staticmethod
+	def getHostname(fqdn=True):
+		"""Get short hostname or fully-qualified hostname of host self"""
+		# try find cached own hostnames (this tuple-key cannot be used elsewhere):
+		key = ('self','hostname', fqdn)
+		name = DNSUtils.CACHE_ipToName.get(key)
+		# get it using different ways (hostname, fully-qualified or vice versa):
+		if name is None:
+			name = ''
+			for hostname in (
+				(getfqdn, socket.gethostname) if fqdn else (socket.gethostname, getfqdn)
+			):
+				try:
+					name = hostname()
+					break
+				except Exception as e: # pragma: no cover
+					logSys.warning("Retrieving own hostnames failed: %s", e)
+		# cache and return :
+		DNSUtils.CACHE_ipToName.set(key, name)
+		return name
 
 	@staticmethod
 	def getSelfNames():
@@ -126,12 +177,9 @@ class DNSUtils:
 		names = DNSUtils.CACHE_ipToName.get(key)
 		# get it using different ways (a set with names of localhost, hostname, fully qualified):
 		if names is None:
-			names = set(['localhost'])
-			for hostname in (socket.gethostname, socket.getfqdn):
-				try:
-					names |= set([hostname()])
-				except Exception as e: # pragma: no cover
-					logSys.warning("Retrieving own hostnames failed: %s", e)
+			names = set([
+				'localhost', DNSUtils.getHostname(False), DNSUtils.getHostname(True)
+			]) - set(['']) # getHostname can return ''
 		# cache and return :
 		DNSUtils.CACHE_ipToName.set(key, names)
 		return names
@@ -175,7 +223,7 @@ class IPAddr(object):
 	__slots__ = '_family','_addr','_plen','_maskplen','_raw'
 
 	# todo: make configurable the expired time and max count of cache entries:
-	CACHE_OBJ = Utils.Cache(maxCount=1000, maxTime=5*60)
+	CACHE_OBJ = Utils.Cache(maxCount=10000, maxTime=5*60)
 
 	CIDR_RAW = -2
 	CIDR_UNSPEC = -1
@@ -183,6 +231,10 @@ class IPAddr(object):
 	FAM_IPv6 = CIDR_RAW - socket.AF_INET6
 
 	def __new__(cls, ipstr, cidr=CIDR_UNSPEC):
+		if cidr == IPAddr.CIDR_RAW: # don't cache raw
+			ip = super(IPAddr, cls).__new__(cls)
+			ip.__init(ipstr, cidr)
+			return ip
 		# check already cached as IPAddr
 		args = (ipstr, cidr)
 		ip = IPAddr.CACHE_OBJ.get(args)
@@ -199,7 +251,8 @@ class IPAddr(object):
 					return ip
 		ip = super(IPAddr, cls).__new__(cls)
 		ip.__init(ipstr, cidr)
-		IPAddr.CACHE_OBJ.set(args, ip)
+		if ip._family != IPAddr.CIDR_RAW:
+			IPAddr.CACHE_OBJ.set(args, ip)
 		return ip
 
 	@staticmethod
@@ -276,7 +329,7 @@ class IPAddr(object):
 			self._family = IPAddr.CIDR_RAW
 
 	def __repr__(self):
-		return self.ntoa
+		return repr(self.ntoa)
 
 	def __str__(self):
 		return self.ntoa

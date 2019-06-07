@@ -79,12 +79,7 @@ class FilterGamin(FileFilter):
 		this is a common logic and must be shared/provided by FileFilter
 		"""
 		self.getFailures(path)
-		try:
-			while True:
-				ticket = self.failManager.toBan()
-				self.jail.putFailTicket(ticket)
-		except FailManagerEmpty:
-			self.failManager.cleanup(MyTime.time())
+		self.performBan()
 		self.__modified = False
 
 	##
@@ -143,6 +138,8 @@ class FilterGamin(FileFilter):
 	# Desallocates the resources used by Gamin.
 
 	def __cleanup(self):
+		if not self.monitor:
+			return
 		for filename in self.getLogPaths():
 			self.monitor.stop_watch(filename)
 		self.monitor = None

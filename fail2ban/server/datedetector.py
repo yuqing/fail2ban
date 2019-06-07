@@ -26,7 +26,9 @@ import time
 
 from threading import Lock
 
-from .datetemplate import re, DateTemplate, DatePatternRegex, DateTai64n, DateEpoch
+from .datetemplate import re, DateTemplate, DatePatternRegex, DateTai64n, DateEpoch, \
+	RE_EPOCH_PATTERN
+from .strptime import validateTimeZone
 from .utils import Utils
 from ..helpers import getLogger
 
@@ -35,7 +37,7 @@ logSys = getLogger(__name__)
 
 logLevel = 6
 
-RE_DATE_PREMATCH = re.compile("\{DATE\}", re.IGNORECASE)
+RE_DATE_PREMATCH = re.compile(r"(?<!\\)\{DATE\}", re.IGNORECASE)
 DD_patternCache = Utils.Cache(maxCount=1000, maxTime=60*60)
 
 
@@ -47,12 +49,18 @@ def _getPatternTemplate(pattern, key=None):
 	template = DD_patternCache.get(key)
 
 	if not template:
-		if key in ("EPOCH", "{^LN-BEG}EPOCH", "^EPOCH"):
-			template = DateEpoch(lineBeginOnly=(key != "EPOCH"))
-		elif key in ("TAI64N", "{^LN-BEG}TAI64N", "^TAI64N"):
-			template = DateTai64n(wordBegin=('start' if key != "TAI64N" else False))
-		else:
-			template = DatePatternRegex(pattern)
+		if "EPOCH" in key:
+			if RE_EPOCH_PATTERN.search(pattern):
+				template = DateEpoch(pattern=pattern, longFrm="LEPOCH" in key)
+			elif key in ("EPOCH", "{^LN-BEG}EPOCH", "^EPOCH"):
+				template = DateEpoch(lineBeginOnly=(key != "EPOCH"))
+			elif key in ("LEPOCH", "{^LN-BEG}LEPOCH", "^LEPOCH"):
+				template = DateEpoch(lineBeginOnly=(key != "LEPOCH"), longFrm=True)
+		if template is None:
+			if key in ("TAI64N", "{^LN-BEG}TAI64N", "^TAI64N"):
+				template = DateTai64n(wordBegin=('start' if key != "TAI64N" else False))
+			else:
+				template = DatePatternRegex(pattern)
 
 	DD_patternCache.set(key, template)
 	return template
@@ -101,9 +109,6 @@ class DateDetectorCache(object):
 		"""Cache Fail2Ban's default template.
 
 		"""
-		if isinstance(template, str):
-			# exact given template with word begin-end boundary:
-			template = _getPatternTemplate(template)
 		# if not already line-begin anchored, additional template, that prefers datetime 
 		# at start of a line (safety+performance feature):
 		name = template.name
@@ -118,60 +123,74 @@ class DateDetectorCache(object):
 		# add template:
 		self.__tmpcache[1].append(template)
 
-	def _addDefaultTemplate(self):
-		"""Add resp. cache Fail2Ban's default set of date templates.
-		"""
-		self.__tmpcache = [], []
+	DEFAULT_TEMPLATES = [
 		# ISO 8601, simple date, optional subsecond and timezone:
-		# 2005-01-23T21:59:59.981746, 2005-01-23 21:59:59
+		# 2005-01-23T21:59:59.981746, 2005-01-23 21:59:59, 2005-01-23  8:59:59
 		# simple date: 2005/01/23 21:59:59 
 		# custom for syslog-ng 2006.12.21 06:43:20
-		self._cacheTemplate("%ExY(?P<_sep>[-/.])%m(?P=_sep)%d[T ]%H:%M:%S(?:[.,]%f)?(?:\s*%z)?")
+		r"%ExY(?P<_sep>[-/.])%m(?P=_sep)%d(?:T|  ?)%H:%M:%S(?:[.,]%f)?(?:\s*%z)?",
 		# asctime with optional day, subsecond and/or year:
 		# Sun Jan 23 21:59:59.011 2005 
-		self._cacheTemplate("(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?")
+		r"(?:%a )?%b %d %k:%M:%S(?:\.%f)?(?: %ExY)?",
 		# asctime with optional day, subsecond and/or year coming after day
 		# http://bugs.debian.org/798923
 		# Sun Jan 23 2005 21:59:59.011
-		self._cacheTemplate("(?:%a )?%b %d %ExY %H:%M:%S(?:\.%f)?")
+		r"(?:%a )?%b %d %ExY %k:%M:%S(?:\.%f)?",
 		# simple date too (from x11vnc): 23/01/2005 21:59:59 
 		# and with optional year given by 2 digits: 23/01/05 21:59:59 
 		# (See http://bugs.debian.org/537610)
 		# 17-07-2008 17:23:25
-		self._cacheTemplate("%d(?P<_sep>[-/])%m(?P=_sep)(?:%ExY|%Exy) %H:%M:%S")
+		r"%d(?P<_sep>[-/])%m(?P=_sep)(?:%ExY|%Exy) %k:%M:%S",
 		# Apache format optional time zone:
 		# [31/Oct/2006:09:22:55 -0000]
 		# 26-Jul-2007 15:20:52
 		# named 26-Jul-2007 15:20:52.252
 		# roundcube 26-Jul-2007 15:20:52 +0200
-		self._cacheTemplate("%d(?P<_sep>[-/])%b(?P=_sep)%ExY[ :]?%H:%M:%S(?:\.%f)?(?: %z)?")
+		r"%d(?P<_sep>[-/])%b(?P=_sep)%ExY[ :]?%H:%M:%S(?:\.%f)?(?: %z)?",
 		# CPanel 05/20/2008:01:57:39
-		self._cacheTemplate("%m/%d/%ExY:%H:%M:%S")
+		r"%m/%d/%ExY:%H:%M:%S",
 		# 01-27-2012 16:22:44.252
 		# subseconds explicit to avoid possible %m<->%d confusion
-		# with previous ("%d-%m-%ExY %H:%M:%S" by "%d(?P<_sep>[-/])%m(?P=_sep)(?:%ExY|%Exy) %H:%M:%S")
-		self._cacheTemplate("%m-%d-%ExY %H:%M:%S(?:\.%f)?")
+		# with previous ("%d-%m-%ExY %k:%M:%S" by "%d(?P<_sep>[-/])%m(?P=_sep)(?:%ExY|%Exy) %k:%M:%S")
+		r"%m-%d-%ExY %k:%M:%S(?:\.%f)?",
 		# Epoch
-		self._cacheTemplate('EPOCH')
+		r"EPOCH",
 		# Only time information in the log
-		self._cacheTemplate("{^LN-BEG}%H:%M:%S")
+		r"{^LN-BEG}%H:%M:%S",
 		# <09/16/08@05:03:30>
-		self._cacheTemplate("^<%m/%d/%Exy@%H:%M:%S>")
+		r"^<%m/%d/%Exy@%H:%M:%S>",
 		# MySQL: 130322 11:46:11
-		self._cacheTemplate("%Exy%Exm%Exd  ?%H:%M:%S")
+		r"%Exy%Exm%Exd  ?%H:%M:%S",
 		# Apache Tomcat
-		self._cacheTemplate("%b %d, %ExY %I:%M:%S %p")
+		r"%b %d, %ExY %I:%M:%S %p",
 		# ASSP: Apr-27-13 02:33:06
-		self._cacheTemplate("^%b-%d-%Exy %H:%M:%S")
-		# 20050123T215959, 20050123 215959
-		self._cacheTemplate("%ExY%Exm%Exd[T ]%ExH%ExM%ExS(?:[.,]%f)?(?:\s*%z)?")
+		r"^%b-%d-%Exy %k:%M:%S",
+		# 20050123T215959, 20050123 215959, 20050123  85959
+		r"%ExY%Exm%Exd(?:T|  ?)%ExH%ExM%ExS(?:[.,]%f)?(?:\s*%z)?",
 		# prefixed with optional named time zone (monit):
 		# PDT Apr 16 21:05:29
-		self._cacheTemplate("(?:%Z )?(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?")
+		r"(?:%Z )?(?:%a )?%b %d %k:%M:%S(?:\.%f)?(?: %ExY)?",
 		# +00:00 Jan 23 21:59:59.011 2005 
-		self._cacheTemplate("(?:%z )?(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?")
+		r"(?:%z )?(?:%a )?%b %d %k:%M:%S(?:\.%f)?(?: %ExY)?",
 		# TAI64N
-		self._cacheTemplate("TAI64N")
+		r"TAI64N",
+	]
+
+	@property
+	def defaultTemplates(self):
+		if isinstance(DateDetectorCache.DEFAULT_TEMPLATES[0], str):
+			for i, dt in enumerate(DateDetectorCache.DEFAULT_TEMPLATES):
+				dt = _getPatternTemplate(dt)
+				DateDetectorCache.DEFAULT_TEMPLATES[i] = dt
+		return DateDetectorCache.DEFAULT_TEMPLATES
+
+	def _addDefaultTemplate(self):
+		"""Add resp. cache Fail2Ban's default set of date templates.
+		"""
+		self.__tmpcache = [], []
+		# cache default templates:
+		for dt in self.defaultTemplates:
+			self._cacheTemplate(dt)
 		#
 		self.__templates = self.__tmpcache[0] + self.__tmpcache[1]
 		del self.__tmpcache
@@ -222,6 +241,8 @@ class DateDetector(object):
 		self.__firstUnused = 0
 		# pre-match pattern:
 		self.__preMatch = None
+		# default TZ (if set, treat log lines without explicit time zone to be in this time zone):
+		self.__default_tz = None
 
 	def _appendTemplate(self, template, ignoreDup=False):
 		name = template.name
@@ -259,8 +280,7 @@ class DateDetector(object):
 					self.addDefaultTemplate(flt)
 					return
 				elif "{DATE}" in key:
-					self.addDefaultTemplate(
-						lambda template: not template.flags & DateTemplate.LINE_BEGIN, pattern)
+					self.addDefaultTemplate(preMatch=pattern, allDefaults=False)
 					return
 				else:
 					template = _getPatternTemplate(pattern, key)
@@ -273,18 +293,20 @@ class DateDetector(object):
 		logSys.debug("  date pattern regex for %r: %s",
 			getattr(template, 'pattern', ''), template.regex)
 
-	def addDefaultTemplate(self, filterTemplate=None, preMatch=None):
+	def addDefaultTemplate(self, filterTemplate=None, preMatch=None, allDefaults=True):
 		"""Add Fail2Ban's default set of date templates.
 		"""
 		ignoreDup = len(self.__templates) > 0
-		for template in DateDetector._defCache.templates:
+		for template in (
+			DateDetector._defCache.templates if allDefaults else DateDetector._defCache.defaultTemplates
+		):
 			# filter if specified:
 			if filterTemplate is not None and not filterTemplate(template): continue
 			# if exact pattern available - create copy of template, contains replaced {DATE} with default regex:
 			if preMatch is not None:
 				# get cached or create a copy with modified name/pattern, using preMatch replacement for {DATE}:
 				template = _getAnchoredTemplate(template,
-					wrap=lambda s: RE_DATE_PREMATCH.sub(lambda m: s, preMatch))
+					wrap=lambda s: RE_DATE_PREMATCH.sub(lambda m: DateTemplate.unboundPattern(s), preMatch))
 			# append date detector template (ignore duplicate if some was added before default):
 			self._appendTemplate(template, ignoreDup=ignoreDup)
 
@@ -423,6 +445,14 @@ class DateDetector(object):
 		logSys.log(logLevel, " no template.")
 		return (None, None)
 
+	@property
+	def default_tz(self):
+		return self.__default_tz
+
+	@default_tz.setter
+	def default_tz(self, value):
+		self.__default_tz = validateTimeZone(value)
+
 	def getTime(self, line, timeMatch=None):
 		"""Attempts to return the date on a log line using templates.
 
@@ -449,7 +479,7 @@ class DateDetector(object):
 		template = timeMatch[1]
 		if template is not None:
 			try:
-				date = template.getDate(line, timeMatch[0])
+				date = template.getDate(line, timeMatch[0], default_tz=self.__default_tz)
 				if date is not None:
 					if logSys.getEffectiveLevel() <= logLevel: # pragma: no cover - heavy debug
 						logSys.log(logLevel, "  got time %f for %r using template %s",
